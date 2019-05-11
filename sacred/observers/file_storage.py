@@ -6,26 +6,17 @@ import os
 import os.path
 import tempfile
 
-from datetime import datetime
 from shutil import copyfile
 
 from sacred.commandline_options import CommandLineOption
 from sacred.dependencies import get_digest
 from sacred.observers.base import RunObserver
-from sacred.utils import FileNotFoundError  # For compatibility with py2
+from sacred.utils import FileNotFoundError, FileExistsError  # py2 compat.
 from sacred import optional as opt
 from sacred.serializer import flatten
 
 
 DEFAULT_FILE_STORAGE_PRIORITY = 20
-
-
-def json_serial(obj):
-    """JSON serializer for objects not serializable by default json code."""
-    if isinstance(obj, datetime):
-        serial = obj.isoformat()
-        return serial
-    raise TypeError("Type not serializable")
 
 
 class FileStorageObserver(RunObserver):
@@ -34,8 +25,6 @@ class FileStorageObserver(RunObserver):
     @classmethod
     def create(cls, basedir, resource_dir=None, source_dir=None,
                template=None, priority=DEFAULT_FILE_STORAGE_PRIORITY):
-        if not os.path.exists(basedir):
-            os.makedirs(basedir)
         resource_dir = resource_dir or os.path.join(basedir, '_resources')
         source_dir = source_dir or os.path.join(basedir, '_sources')
         if template is not None:
@@ -60,9 +49,12 @@ class FileStorageObserver(RunObserver):
         self.config = None
         self.info = None
         self.cout = ""
+        self.cout_write_cursor = 0
 
     def queued_event(self, ex_info, command, host_info, queue_time, config,
                      meta_info, _id):
+        if not os.path.exists(self.basedir):
+            os.makedirs(self.basedir)
         if _id is None:
             self.dir = tempfile.mkdtemp(prefix='run_', dir=self.basedir)
         else:
@@ -99,14 +91,26 @@ class FileStorageObserver(RunObserver):
 
     def started_event(self, ex_info, command, host_info, start_time, config,
                       meta_info, _id):
+        if not os.path.exists(self.basedir):
+            os.makedirs(self.basedir)
         if _id is None:
-            dir_nrs = [int(d) for d in os.listdir(self.basedir)
-                       if os.path.isdir(os.path.join(self.basedir, d)) and
-                       d.isdigit()]
-            _id = max(dir_nrs + [0]) + 1
-
-        self.dir = os.path.join(self.basedir, str(_id))
-        os.mkdir(self.dir)
+            for i in range(200):
+                dir_nrs = [int(d) for d in os.listdir(self.basedir)
+                           if os.path.isdir(os.path.join(self.basedir, d)) and
+                           d.isdigit()]
+                _id = max(dir_nrs + [0]) + 1
+                self.dir = os.path.join(self.basedir, str(_id))
+                try:
+                    os.mkdir(self.dir)
+                    break
+                except FileExistsError:  # Catch race conditions
+                    if i > 100:
+                        # After some tries,
+                        # expect that something other went wrong
+                        raise
+        else:
+            self.dir = os.path.join(self.basedir, str(_id))
+            os.mkdir(self.dir)
 
         ex_info['sources'] = self.save_sources(ex_info)
 
@@ -124,6 +128,7 @@ class FileStorageObserver(RunObserver):
         self.config = config
         self.info = {}
         self.cout = ""
+        self.cout_write_cursor = 0
 
         self.save_json(self.run_entry, 'run.json')
         self.save_json(self.config, 'config.json')
@@ -151,8 +156,9 @@ class FileStorageObserver(RunObserver):
         copyfile(filename, os.path.join(self.dir, target_name))
 
     def save_cout(self):
-        with open(os.path.join(self.dir, 'cout.txt'), 'wb') as f:
-            f.write(self.cout.encode('utf-8'))
+        with open(os.path.join(self.dir, 'cout.txt'), 'ab') as f:
+            f.write(self.cout[self.cout_write_cursor:].encode("utf-8"))
+            self.cout_write_cursor = len(self.cout)
 
     def render_template(self):
         if opt.has_mako and self.template:
@@ -203,10 +209,39 @@ class FileStorageObserver(RunObserver):
         self.run_entry['resources'].append([filename, store_path])
         self.save_json(self.run_entry, 'run.json')
 
-    def artifact_event(self, name, filename):
+    def artifact_event(self, name, filename, metadata=None, content_type=None):
         self.save_file(filename, name)
         self.run_entry['artifacts'].append(name)
         self.save_json(self.run_entry, 'run.json')
+
+    def log_metrics(self, metrics_by_name, info):
+        """Store new measurements into metrics.json.
+        """
+        try:
+            metrics_path = os.path.join(self.dir, "metrics.json")
+            with open(metrics_path, 'r') as f:
+                saved_metrics = json.load(f)
+        except IOError:
+            # We haven't recorded anything yet. Start Collecting.
+            saved_metrics = {}
+
+        for metric_name, metric_ptr in metrics_by_name.items():
+
+            if metric_name not in saved_metrics:
+                saved_metrics[metric_name] = {"values": [],
+                                              "steps": [],
+                                              "timestamps": []}
+
+            saved_metrics[metric_name]["values"] += metric_ptr["values"]
+            saved_metrics[metric_name]["steps"] += metric_ptr["steps"]
+
+            # Manually convert them to avoid passing a datetime dtype handler
+            # when we're trying to convert into json.
+            timestamps_norm = [ts.isoformat()
+                               for ts in metric_ptr["timestamps"]]
+            saved_metrics[metric_name]["timestamps"] += timestamps_norm
+
+        self.save_json(saved_metrics, 'metrics.json')
 
     def __eq__(self, other):
         if isinstance(other, FileStorageObserver):
