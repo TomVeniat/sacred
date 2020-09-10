@@ -237,8 +237,8 @@ class Run:
                 self._execute_pre_run_hooks()
                 self.result = self.main_function(*args)
                 self._execute_post_run_hooks()
-                if self.result is not None:
-                    self.run_logger.info("Result: {}".format(self.result))
+                # if self.result is not None:
+                #     self.run_logger.info("Result: {}".format(self.result))
                 elapsed_time = self._stop_time()
                 self.run_logger.info("Completed after %s", elapsed_time)
                 self._get_captured_output()

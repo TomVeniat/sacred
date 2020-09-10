@@ -345,7 +345,12 @@ class MongoObserver(RunObserver):
                 "timestamps": {"$each": metrics_by_name[key]["timestamps"]},
             }
             update = {"$push": push}
-            result = self.metrics.update_one(query, update, upsert=True)
+            try:
+                result = self.metrics.update_one(query, update, upsert=True)
+            except Exception as e:
+                print("error when updating {}".format(key))
+                raise e
+
             if result.upserted_id is not None:
                 # This is the first time we are storing this metric
                 info.setdefault("metrics", []).append(
